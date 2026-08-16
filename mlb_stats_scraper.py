@@ -211,6 +211,79 @@ def bouw_fielding_rij(split, teaminfo):
     return rij
 
 
+def parse_getal(waarde):
+    """Zet een stat-waarde (int, of string als '.314'/'139.0') om naar float, of None."""
+    if waarde is None:
+        return None
+    try:
+        return float(waarde)
+    except (TypeError, ValueError):
+        return None
+
+
+def sorteer_batting(batting_data):
+    """
+    Beste spelers eerst: batting average, maar alleen 'gekwalificeerd' als
+    AB >= 25% van de AB van de leider (de speler met de meeste at-bats dit
+    seizoen). Niet-gekwalificeerde spelers blijven zichtbaar, maar staan
+    onder de gekwalificeerde groep (net als bij officiële titel-races).
+    """
+    ab_waarden = [parse_getal(r.get("ab")) for r in batting_data]
+    ab_waarden = [w for w in ab_waarden if w is not None]
+    max_ab = max(ab_waarden) if ab_waarden else 0
+    drempel = 0.25 * max_ab
+
+    def sleutel(r):
+        ab = parse_getal(r.get("ab")) or 0
+        avg = parse_getal(r.get("avg"))
+        gekwalificeerd = drempel > 0 and ab >= drempel
+        avg_waarde = avg if avg is not None else -1
+        return (0 if gekwalificeerd else 1, -avg_waarde)
+
+    batting_data.sort(key=sleutel)
+    return drempel
+
+
+def sorteer_pitching(pitching_data):
+    """
+    Beste spelers eerst: ERA, maar alleen 'gekwalificeerd' als IP >= 10% van
+    de IP van de leider (de pitcher met de meeste innings pitched dit
+    seizoen). Niet-gekwalificeerde spelers blijven zichtbaar, maar staan
+    onder de gekwalificeerde groep.
+    """
+    ip_waarden = [parse_getal(r.get("ip")) for r in pitching_data]
+    ip_waarden = [w for w in ip_waarden if w is not None]
+    max_ip = max(ip_waarden) if ip_waarden else 0
+    drempel = 0.10 * max_ip
+
+    def sleutel(r):
+        ip = parse_getal(r.get("ip")) or 0
+        era = parse_getal(r.get("era"))
+        gekwalificeerd = drempel > 0 and ip >= drempel
+        era_waarde = era if era is not None else 999
+        return (0 if gekwalificeerd else 1, era_waarde)
+
+    pitching_data.sort(key=sleutel)
+    return drempel
+
+
+def dedupliceer_fielding(fielding_data):
+    """
+    De MLB-fielding-API levert per gespeelde positie een aparte regel, dus
+    een speler die op meerdere posities speelde (bv. 1B + C + DH) komt
+    meerdere keren voor. Hou per speler alleen de regel met de meeste
+    gespeelde wedstrijden aan (zijn hoofdpositie), zodat elke speler maar
+    één keer in de lijst staat.
+    """
+    per_speler = {}
+    for rij in fielding_data:
+        sleutel = rij.get("speler_id") or rij.get("name")
+        huidige = per_speler.get(sleutel)
+        if huidige is None or (parse_getal(rij.get("g")) or 0) > (parse_getal(huidige.get("g")) or 0):
+            per_speler[sleutel] = rij
+    return list(per_speler.values())
+
+
 def bouw_teams_lookup(teaminfo):
     """team-lookup (naam + logo) per teamcode, voor de Teams-tab in de PHP-widget."""
     lookup = {}
@@ -243,20 +316,21 @@ def main():
     print("\nBatting-statistieken ophalen...")
     batting_splits = fetch_alle_splits("hitting", seizoen)
     batting_data = [bouw_batting_rij(s, teaminfo) for s in batting_splits]
-    batting_data.sort(key=lambda r: (r["team"] or "", r["name"] or ""))
-    print(f"→ {len(batting_data)} batters")
+    ab_drempel = sorteer_batting(batting_data)
+    print(f"→ {len(batting_data)} batters (AB-kwalificatiedrempel: {ab_drempel:.1f})")
 
     print("\nPitching-statistieken ophalen...")
     pitching_splits = fetch_alle_splits("pitching", seizoen)
     pitching_data = [bouw_pitching_rij(s, teaminfo) for s in pitching_splits]
-    pitching_data.sort(key=lambda r: (r["team"] or "", r["name"] or ""))
-    print(f"→ {len(pitching_data)} pitchers")
+    ip_drempel = sorteer_pitching(pitching_data)
+    print(f"→ {len(pitching_data)} pitchers (IP-kwalificatiedrempel: {ip_drempel:.1f})")
 
     print("\nFielding-statistieken ophalen...")
     fielding_splits = fetch_alle_splits("fielding", seizoen)
-    fielding_data = [bouw_fielding_rij(s, teaminfo) for s in fielding_splits]
-    fielding_data.sort(key=lambda r: (r["team"] or "", r["name"] or ""))
-    print(f"→ {len(fielding_data)} fielding-regels")
+    fielding_data_ruw = [bouw_fielding_rij(s, teaminfo) for s in fielding_splits]
+    fielding_data = dedupliceer_fielding(fielding_data_ruw)
+    fielding_data.sort(key=lambda r: -(parse_getal(r.get("g")) or 0))
+    print(f"→ {len(fielding_data)} spelers ({len(fielding_data_ruw)} regels vóór dedupliceren op hoofdpositie)")
 
     nu = dt.datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     nieuw = {
@@ -280,9 +354,11 @@ def main():
 
     output = {
         "meta": {
-            "seizoen":      seizoen,
-            "last_updated": last_updated,
-            "last_checked": nu,
+            "seizoen":       seizoen,
+            "last_updated":  last_updated,
+            "last_checked":  nu,
+            "ab_drempel":    round(ab_drempel, 1),
+            "ip_drempel":    round(ip_drempel, 1),
         },
         **nieuw,
     }
